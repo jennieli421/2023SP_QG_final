@@ -1,0 +1,576 @@
+---
+title: "QG23 Project Codes"
+author: "Jennie Li (Weill-xil4009)"
+date: "2023-04-26"
+output:
+  html_document:
+    toc: yes
+    toc_float: no
+    df_print: paged
+    theme: cosmo
+toc-title: Overview
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# The experiment and data
+
+
+## The experiment  
+
+About a decade ago, the large scale human genomics resources Genetic European Variation in Health and Disease (gEUVADIS) was made available (now a part of larger genomics consortium efforts but still relevant / relevant data!) - see the following links for relevant descriptions and information:
+
+[geuvadis](http://www.internationalgenome.org/data-portal/data-collection/geuvadis/)
+
+[Nature Artical](https://www.nature.com/articles/nature12531)
+
+with a samples from 4 different European populations. Each of these individuals were part of the 1000 Genomes project and their genomes were sequenced and analyzed to identify SNP geno- types. For expression profiling, lympoblastoid cell lines (LCL) were generated from each sample and mRNA levels were quantified through RNA sequencing.
+
+Each of these gene expression measurements may be thought of as a phenotype and one can do a GWAS analysis on each individually, which is called an `expression Quantitative Trait Locus` or `eQTL` analysis, an unnecessarily fancy name for a GWAS when the phenotype is gene expression!
+
+What you have been provided is a small subset of these data that are publicly available. Specifically, you have been provided 50,000 of the SNP genotypes for 344 samples from the CEU (Utah residents with European ancestry), FIN (Finns), GBR (British) and, TSI (Toscani) population. For these same individuals, you have also been provided the expression levels of five genes. You have also been provided information on the population and gender of each of these individuals, and information regarding the position of each gene and SNP in the genome. 
+
+
+
+## The data
+These have been provided to you in five total files: `phenotypes.csv`,`genotypes.csv`, `covars.csv`, `gene_info.csv`,`SNP_info.csv`.
+
+* `phenotypes.csv` contains the phenotype data for 344 samples and 5 genes.
+* `genotypes.csv` contains the SNP data for 344 samples and 50000 genotypes.
+* `covars.csv` contains the population origin and gender information for the 344 samples.
+* `gene_info.csv` contains information about each gene that was measured. The `chromosome' column indicates the chromosome where the gene is located, `start' marks the position in the chromosome where the region of the gene begins and `end' marks the position where the region ends, `symbol' contains the common gene name of the measured transcript and `probe' contains the ids of the transcripts that match with the column names of the phenotype data.
+* `SNP_info.csv` contains the additional information on the genotypes and has four columns. The 1st column contains the chromosome number of each SNP, the 2nd column contains the physical position of the SNP on the chromosome, the 3rd column contains the abbreviation used to the `rsID' = the name of each SNP in order.
+
+
+# Assignment 
+Your GWAS assignment is to find the position of as many causal polymorphisms as possible for the five expressed genes using the data (note that each `hit' will potentially indicate an eQTL). You may / should use any and as many analysis approaches as you think that are useful to accomplish this goal. In your report, you will need to describe in detail what you did, why you did it, and describe results in a manner that your `non-statistical' collaborator will be able to understand, e.g. explain your terms, provide interpretations, etc.
+
+## Libraries 
+```{r message=F, warning=F}
+library(ggplot2)
+library(tidyverse)
+library(MASS)
+library(glue)
+library(dplyr)
+library(data.table)
+library(grid)
+library(gridExtra)
+```
+
+
+## Load Data 
+```{r}
+phenotype <- read.csv("phenotypes.csv", row.names = 1)
+genotype <- read.csv("genotypes.csv", row.names = 1)
+covars <- read.csv("covars.csv", row.names = 1)
+gene_info <- read.csv("gene_info.csv")
+SNP_info <- read.csv("SNP_info.csv")
+```
+
+
+## Data formatting 
+```{r}
+# replace Gene ID by Symbols
+for (i in 1:length(colnames(phenotype))) {
+  colnames(phenotype)[i] <- gene_info[gene_info$probe == colnames(phenotype)[i], ]$symbol
+}
+
+# condoing covars as numbers
+covars$Sex.numeric <- as.numeric(covars$Sex == "FEMALE")
+
+# Convert Population column to one-hot encoding
+covars$GBR.numeric <- ifelse(covars$Population == "GBR", 1, 0)
+covars$FIN.numeric <- ifelse(covars$Population == "FIN", 1, 0)
+covars$CEU.numeric <- ifelse(covars$Population == "CEU", 1, 0)
+covars$TSI.numeric <- ifelse(covars$Population == "TSI", 1, 0)
+```
+
+
+## Histogram of phenotypes
+
+```{r}
+n <- nrow(phenotype)
+glue("Sample size (n): {n}")
+
+par(mfrow = c(1, ncol(phenotype))) # Set up multiple plots
+# phenotype histogram 
+for (col in names(phenotype)) {
+  hist(phenotype[[col]], main = col, xlab = col)
+}
+
+N <- ncol(genotype)  # number of SNPs
+n <- nrow(genotype)  # sample size 
+glue("Number of SNPs (N): {N}")
+```
+
+
+## Generate Xa and Xd  Matrix 
+Note that the genotypes are already in Xa codings, and you only have to create the Xd matrix from it.
+
+```{r}
+geno_xa <- genotype - 1
+geno_xd <- (abs(geno_xa)*2)-1  # 1 - 2*abs(xa_matrix)?
+```
+
+
+## GWAS with Covariates 
+
+### Run GWAS an get p-values with covariates 
+```{r}
+# Define function for GWAS with multiple covar and get p-values
+
+pval_w_covars <- function(pheno_input, xa_input, xd_input, xz_input){
+
+  n_samples <- length(xa_input) # number of samples
+
+  X_mx <- cbind(rep(1,length(xa_input)),xa_input, xd_input) #create your X matrix under H1
+  # append all covariates 
+  for (i in 1:ncol(xz_input)) {
+    X_mx <- cbind(X_mx, xz_input[,i])
+  }
+
+  MLE_beta <- ginv(t(X_mx) %*% X_mx) %*% t(X_mx) %*% pheno_input #calculate your MLE of the betas
+  
+  x_h0 =  cbind(rep(1,length(xa_input))) #calculate your x under H0
+  # append all covariates 
+  for (i in 1:ncol(xz_input)) {
+    x_h0 <- cbind(x_h0, xz_input[,i])
+  }
+  
+  MLE_h0 = ginv(t(x_h0) %*% x_h0) %*% t(x_h0) %*% pheno_input #calculate your MLE under h0
+  
+  y_hat_0 = x_h0 %*% MLE_h0 #calculate y_hat under the null hypothesis
+  y_hat_1 = X_mx%*% MLE_beta #calculate y_hat under H1
+  
+  SSE_theta_0 = sum((pheno_input-y_hat_0)^2) #calculate SSE under null 
+  SSE_theta_1 = sum((pheno_input-y_hat_1)^2) #calculate SSE under H1
+  
+  n_betas_h1 <- ncol(X_mx)
+  n_betas_h0 <- ncol(x_h0)
+  df_M <- n_betas_h1 - n_betas_h0
+  df_E <- n_samples - n_betas_h1
+  
+  numerator <- (SSE_theta_0-SSE_theta_1) / df_M #calculate your F statistic
+  denom <- SSE_theta_1 / df_E
+  Fstatistic <-numerator / denom
+  
+  # to check if it is correct 
+  pval <- pf(Fstatistic, df_M, df_E,lower.tail = FALSE) #calculate your p value and return it
+  return(pval)
+}
+```
+
+
+### Manhattan plot and QQ plot 
+
+```{r}
+gwas <- function(geno_xa, geno_xd, covars, pheno) {
+  result_df <- lapply(1:ncol(geno_xa), function(column.counter){
+    data.table(pval_w_covars(pheno_input = pheno,
+                            xa_input = geno_xa[, column.counter],
+                            xd_input = geno_xd[, column.counter],
+                            xz_input = covars))
+                }) %>% rbindlist() %>% mutate(p=V1, index = 1:ncol(geno_xa))
+  
+  # combine SNP information with the result_df
+  result_df <- cbind(result_df, SNP_info)
+  
+  return (result_df)
+}
+```
+
+
+```{r}
+man_qq_plot <- function(result_df, name){
+  
+  # Manhattan Plot
+  my.alpha = 0.05/nrow(result_df)
+  
+  man <- ggplot(result_df, aes(x = index, y = -log10(p))) +
+          geom_point(aes(color=factor(chromosome %% 2) )) + 
+          scale_color_manual(values = c("blue","light blue")) + 
+          geom_hline(yintercept = -log10(my.alpha), color = 'red', lty = 2) +
+          labs(x = 'Index', y = expression(-log[10]~p), 
+               title = 'GWAS Manhattan Plot', subtitle='Covariates Included') + 
+          theme(legend.position = "none")
+
+  # QQ plot
+  observed_pvals = sort(result_df$p)
+  expected_pvals = qunif(seq(0, 1, length.out = length(observed_pvals) + 2), min = 0, max = 1)  ## Generate expected values. Note that we are using length+2
+  expected_pvals = expected_pvals[expected_pvals != 0 & expected_pvals != 1]  ## Remove the two extra values since they are 0 and 1
+  
+  p_df = data.frame(observed = -log10(observed_pvals),
+                    expected = -log10(expected_pvals))
+  
+  qq <- ggplot(p_df, aes(x = expected, y = observed)) +
+    geom_point() +
+    geom_abline(intercept = 0, slope = 1, color = 'red') +
+    labs(x = '-log10 Expected p-val',
+         y = '-log10 Observed p-val',
+         title = 'GWAS QQ plot', subtitle = 'Covariates Included')
+  
+ plots <- grid.arrange(man,qq, ncol=2, top=textGrob(name, gp=gpar(fontsize=20,font=3)))
+ 
+ ggsave(sprintf("plot/plots_%s_color.png",name), plots)
+}
+```
+
+
+```{r}
+# Subset columns with ".numeric" in the column name
+numeric_covars <- covars[, grepl(".numeric", colnames(covars))]
+
+results <- list()
+# ncol(phenotype)
+for (i in 1:ncol(phenotype)) {
+  results[[i]] <- gwas(geno_xa, geno_xd, numeric_covars, phenotype[,i])
+  man_qq_plot(results[[i]], colnames(phenotype)[i]) 
+}
+```
+
+
+
+### Significant SNP position and close-up Manhattan plot
+
+
+```{r}
+my.alpha = 0.05/ncol(genotype)
+
+sig_results <- list()
+for (i in 1:length(results)) {
+  sig_results[[i]] = subset(results[[i]], p < my.alpha)
+}
+# ERAP2
+cat("positions of significant loci correlated with ERAP2: \n")
+sig_results[[1]]$position
+
+# PEX6
+cat("positions of significant loci correlated with pex6: \n")
+sig_results[[2]]$position
+
+# FAHD1
+cat("positions of significant loci correlated with FAHD1: \n")
+sig_results[[3]]$position
+
+# GFM1
+
+# MARCH7
+```
+
+
+```{r}
+sig_hit_man_plot <- function(sig, name, my.alpha) {
+    # Significant hits Manhattan Plot
+    man <- ggplot(sig, aes(x = index, y = -log10(p))) +
+            geom_point(aes(color=factor(chromosome %% 2) )) + 
+            scale_color_manual(values = c("blue","light blue")) + 
+            geom_hline(yintercept = -log10(my.alpha), color = 'red', lty = 2) +
+            labs(x = 'Index', y = expression(-log[10]~p), 
+                 title = sprintf("Phenotype %s", name)) + 
+            theme(legend.position = "none")
+    return(man)
+}
+
+p1 <- sig_hit_man_plot(sig_results[[1]], colnames(phenotype)[1], my.alpha)
+p2 <- sig_hit_man_plot(sig_results[[2]], colnames(phenotype)[2], my.alpha)
+p3 <- sig_hit_man_plot(sig_results[[3]], colnames(phenotype)[3], my.alpha)
+
+plots <- grid.arrange(p1, p2, p3, ncol=3, 
+                      top=textGrob("High Resoslution Manhattan Plots", gp=gpar(fontsize=14,font=2) ))
+ggsave("plot/high_resolution.png", plots)
+```
+
+
+
+## Results with estimated Betas 
+
+```{r}
+mle_beta <- function(pheno_input, xa_input, xd_input, xz_input){
+
+  n_samples <- length(xa_input) # number of samples
+
+  X_mx <- cbind(rep(1,length(xa_input)),xa_input, xd_input) #create your X matrix under H1
+  # append all covariates 
+  for (i in 1:ncol(xz_input)) {
+    X_mx <- cbind(X_mx, xz_input[,i])
+  }
+
+  MLE_beta <- ginv(t(X_mx) %*% X_mx) %*% t(X_mx) %*% pheno_input #calculate your MLE of the betas
+  
+  x_h0 =  cbind(rep(1,length(xa_input))) #calculate your x under H0
+  # append all covariates 
+  for (i in 1:ncol(xz_input)) {
+    x_h0 <- cbind(x_h0, xz_input[,i])
+  }
+  
+  MLE_h0 = ginv(t(x_h0) %*% x_h0) %*% t(x_h0) %*% pheno_input #calculate your MLE under h0
+  
+  y_hat_0 = x_h0 %*% MLE_h0 #calculate y_hat under the null hypothesis
+  y_hat_1 = X_mx%*% MLE_beta #calculate y_hat under H1
+  
+  SSE_theta_0 = sum((pheno_input-y_hat_0)^2) #calculate SSE under null 
+  SSE_theta_1 = sum((pheno_input-y_hat_1)^2) #calculate SSE under H1
+  
+  n_betas_h1 <- ncol(X_mx)
+  n_betas_h0 <- ncol(x_h0)
+  df_M <- n_betas_h1 - n_betas_h0
+  df_E <- n_samples - n_betas_h1
+  
+  numerator <- (SSE_theta_0-SSE_theta_1) / df_M #calculate your F statistic
+  denom <- SSE_theta_1 / df_E
+  Fstatistic <-numerator / denom
+  
+  # to check if it is correct 
+  pval <- pf(Fstatistic, df_M, df_E,lower.tail = FALSE) #calculate your p value and return it
+
+  return(data.table(p=pval, beta_mu=MLE_beta[1], beta_a=MLE_beta[2], beta_d=MLE_beta[3], covar_sex=MLE_beta[4], covar_GBR=MLE_beta[5], covar_FIN=MLE_beta[6], covar_CEU=MLE_beta[7], covar_TSI=MLE_beta[8]))
+}
+
+
+gwas <- function(geno_xa, geno_xd, covars, pheno) {
+  result_df <- lapply(1:ncol(geno_xa), function(column.counter){
+    data.table(mle_beta(pheno_input = pheno,
+                            xa_input = geno_xa[, column.counter],
+                            xd_input = geno_xd[, column.counter],
+                            xz_input = covars))
+                }) %>% rbindlist() 
+
+    # combine SNP information with the result_df
+  result_df <- cbind(result_df, SNP_info)
+  
+  return (result_df)
+}
+
+numeric_covars <- covars[, grepl(".numeric", colnames(covars))]
+results <- list()
+# ncol(phenotype)
+for (i in 1:ncol(phenotype)) {
+  results[[i]] <- gwas(geno_xa, geno_xd, numeric_covars, phenotype[,i])
+}
+
+head(results[[1]])
+```
+
+
+
+## Logistic GWAS 
+
+```{r, eval=F}
+# Calculate the error term (gamma inverse)
+gamma_inv_calc <- function(X_mx, beta_t){
+    #initialize gamma
+    # K is the part which goes into the exponent
+    K <- X_mx %*% beta_t
+    gamma_inv <- exp(K)/(1+exp(K))
+    return(gamma_inv)
+}
+
+# Calculate the variance of our error
+W_calc <- function(gamma_inv){
+        W <- diag(as.vector(gamma_inv * (1- gamma_inv)))
+    return(W)
+}
+
+# Calculate our beta estimates given the error term and variance of error (gamma inverse and W respectively)
+beta_update <- function(X_mx, W, Y, gamma_inv, beta){
+  #print(dim(X_mx))
+  #print(dim(W))
+  beta_up <- beta + ginv(t(X_mx)%*%W%*%X_mx)%*%t(X_mx)%*%(Y-gamma_inv)
+    return(beta_up)
+}
+
+# Calculate re-weighting model deviance & loglikelihood of our final estimates
+dev_calc <- function(Y, gamma_inv){
+    deviance <- 2*( sum(Y[Y==1]*log(Y[Y==1]/gamma_inv[Y==1])) + sum((1-Y[Y==0])*log((1-Y[Y==0])/(1-gamma_inv[Y==0]))) )  
+    return(deviance)
+}
+
+loglik_calc <- function(Y, gamma_inv){
+    loglik <- sum(Y*log(gamma_inv)+(1-Y)*log(1-gamma_inv))
+    return(loglik)
+}
+```
+
+
+
+### For loop 
+
+
+```{r, eval=F}
+logistic.IRLS<- function(X_mx,Y =Y, beta.initial.vec = c(0,0,0),
+                         d.stop.th = 1e-6, it.max = 100) {
+  #check this matrix:
+    #initialize the beta parameter vector at t=0
+    beta_t <- beta.initial.vec
+  
+  # initialize deviance at d[t]
+    dt <- 0
+    
+    #initialize gamma
+  # K is the part which goes into the exponent
+  gamma_inv <- gamma_inv_calc(X_mx, beta_t)
+    
+    for(i in 1:it.max) {
+        dpt1 <- dt #store previous deviance
+        
+    # create empty matrix W
+        W <- W_calc(gamma_inv)
+    
+        beta_t <- beta_update(X_mx, W, Y, gamma_inv, beta_t)
+        
+        #update gamma since it's a function of beta
+        
+        gamma_inv <- gamma_inv_calc(X_mx, beta_t)
+        #calculate new deviance
+        dt <- dev_calc(Y, gamma_inv)
+        
+        absD <- abs(dt - dpt1)
+        
+        if(absD < d.stop.th) {
+            #cat("Convergence at iteration:", i, "at threshold:", d.stop.th, "\n")
+            logl <- loglik_calc(Y, gamma_inv)
+            return(list(beta_t,logl))
+        }   
+    }
+    #cat("Convergence not reached after iteration:", i, "at threshold:", d.stop.th, "\n")
+    return(list(beta_t= c(NA,NA,NA),logl=NA))
+}
+
+logistic.IRLS.pval <- function( Xa, Xd,Y, beta.initial.vec = c(0,0,0),
+                                d.stop.th = 1e-6, it.max = 100) {
+  
+  #Initialize
+  beta_t <- beta.initial.vec
+    dt <- 0
+    
+  X_mx <- cbind(rep(1,nrow(Y)), Xa, Xd)
+  gamma_inv <- gamma_inv_calc(X_mx, beta_t)
+    h1 <- logistic.IRLS( X_mx, Y=Y, beta.initial.vec = c(0,0,0),
+                         d.stop.th = 1e-6, it.max = 100)
+    
+    X_mx <- cbind(rep(1,nrow(Y)), rep(0,nrow(Y)),rep(0,nrow(Y)))
+  gamma_inv <- gamma_inv_calc(X_mx, beta_t)
+    h0 <- logistic.IRLS( X_mx, Y=Y, beta_t, d.stop.th = 1e-6, it.max = 100)
+  
+    LRT <- 2*h1[[2]]-2*h0[[2]] #likelihood ratio test statistic
+  pval <- pchisq(LRT, 2, lower.tail = F)
+    return(pval)
+}
+```
+
+
+
+### Recursion 
+```{r, eval=F}
+logistic.IRLS.recursive <- function(Y, X_mx, beta_t, dpt1, gamma_inv,
+                                    iter, d.stop.th = 1e-6, it.max = 100){
+    # create empty matrix W
+        W <- W_calc(gamma_inv)
+    
+        beta_t <- beta_update(X_mx, W, Y, gamma_inv, beta_t)
+        
+        #update gamma since it's a function of beta
+        gamma_inv <- gamma_inv_calc(X_mx, beta_t)
+        
+        #calculate new deviance
+        dt <- dev_calc(Y, gamma_inv)
+        absD <- abs(dt - dpt1)
+        
+        if(absD < d.stop.th | iter > it.max) {
+            #cat("Convergence at iteration:", i, "at threshold:", d.stop.th, "\n")
+            logl <- loglik_calc(Y, gamma_inv)
+            return(list(beta_t,logl))
+        }   else {
+          return(logistic.IRLS.recursive(Y, X_mx, beta_t, dt, gamma_inv, iter+1,
+                                         d.stop.th = 1e-6, it.max = 100))
+        }
+}
+```
+
+
+```{r, eval=F}
+logistic.IRLS.recursive.pval <- function(Xa,Xd,Y, beta.initial.vec = c(0,0,0),
+                                         d.stop.th = 1e-6, it.max = 100) {
+  #Initialize
+  beta_t <- beta.initial.vec
+    dt <- 0
+    
+  X_mx <- cbind(rep(1,nrow(Y)), Xa, Xd)
+  gamma_inv <- gamma_inv_calc(X_mx, beta_t)
+    h1 <- logistic.IRLS.recursive(Y, X_mx, beta_t, dt, gamma_inv,
+                                  1, d.stop.th = 1e-6, it.max = 100)
+    
+    X_mx <- cbind(rep(1,nrow(Y)), rep(0,nrow(Y)),rep(0,nrow(Y)))
+  gamma_inv <- gamma_inv_calc(X_mx, beta_t)
+    h0 <- logistic.IRLS.recursive(Y, X_mx, beta_t, dt, gamma_inv,
+                                  1, d.stop.th = 1e-6, it.max = 100)
+
+    LRT <- 2*h1[[2]]-2*h0[[2]] #likelihood ratio test statistic
+  pval <- pchisq(LRT, 2, lower.tail = F)
+    return(pval)
+}
+```
+
+
+```{r, eval=F}
+pval <- logistic.IRLS.pval( Xa = geno_xa[,1], Xd = geno_xd[,1], as.matrix(phenotype[,1]))
+cat("The pval is", pval)
+
+pval <- logistic.IRLS.recursive.pval( Xa = geno_xa[,1], Xd = geno_xd[,1], as.matrix(phenotype[,1]))
+cat("The pval is", pval)
+```
+
+
+### Apply the IRLS to calculate all p-values for phenotype 1 
+```{r, eval=F}
+# Think about dimensions of each element here. Break it down and draw it out, whatever you can to visualize
+allPvals <- apply(rbind(geno_xa,geno_xd), 2, 
+                  function(x) logistic.IRLS.pval(Xa=x[1:nrow(geno_xa)], Xd=x[(nrow(geno_xa)+1):length(x)], as.matrix(phenotype[,1])))
+```
+
+
+
+```{r, eval=F}
+plot_df <- data.frame(p = allPvals, index = seq(1:length(allPvals)))
+
+# Manhattan Plot
+my.alpha = 0.05/ncol(geno_xa)
+man <- ggplot(plot_df, aes(x = index, y = -log10(p))) +
+  geom_point() + 
+  geom_hline(yintercept = -log10(my.alpha), color = 'red', lty = 2) +
+  labs(x = 'Index', y = expression(-log[10]~p), title = 'No Covariates')
+
+# QQ plot
+observed_pvals = sort(plot_df$p)
+expected_pvals = qunif(seq(0, 1, length.out = length(observed_pvals) + 2), min = 0, max = 1)  ## Generate expected values. Note that we are using length+2
+expected_pvals = expected_pvals[expected_pvals != 0 & expected_pvals != 1]  ## Remove the two extra values since they are 0 and 1
+
+p_df = data.frame(observed = -log10(observed_pvals),
+                  expected = -log10(expected_pvals))
+
+qq <- ggplot(p_df, aes(x = expected, y = observed)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, color = 'red') +
+  labs(x = '-log10 Expected p-val',
+       y = '-log10 Observed p-val',
+       title = 'GWAS QQ plot',
+       subtitle = 'Covariatesu Included')
+
+grid.arrange(man,qq, ncol=2, top=textGrob(pheno_name[1], gp=gpar(fontsize=20,font=3)))
+```
+
+
+
+### Adding covars to IRLS
+
+```{r, eval=F}
+# X_mx_forH0 <- cbind( 1, Covariates...)
+# X_mx_forH1 <- cbind( 1, Xa, Xd, Covariates...)
+# Then call IRLS and then calculate LRT and then pval
+```
+
+
+
+
